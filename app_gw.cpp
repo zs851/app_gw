@@ -25,6 +25,21 @@ int data_trans::OnOpen(E15_ServerInfo * info,E15_String *& json) {
             m_pos_server = info->id;
         else if (!strcmp(info->role, g_conf.trade_gw.c_str()))
             m_trade_gw = info->id;
+        else if (!strcmp(info->role, g_conf.trade_server.c_str()))
+            m_gw->notify_trader_offline(info->name);
+    } else {
+        rapidjson::Document::AllocatorType& alloc = m_doc.GetAllocator();
+        m_doc.AddMember("action", "loginMsg", alloc);
+        m_doc.AddMember("uid", rapidjson::Value().SetString(info->name, strlen(info->name)), alloc);
+
+        m_doc.Accept(m_writer);
+        std::string json = m_buffer.GetString();
+        m_doc.RemoveAllMembers();
+        m_buffer.Clear();
+        m_writer.Reset(m_buffer);
+        post_phpserver(false, info, MSG_NOTIFY_USRLOGIN, json.c_str(), json.size());
+        g_logger.print_ts("[OnOpen] 通知php后台用户%s(%x:%x)上线 %s\n", info->name,
+                          info->id.h, info->id.l, json.c_str());
     }
     return 1;
 }
@@ -37,36 +52,74 @@ int data_trans::OnClose(E15_ServerInfo * info) {
             m_pos_server.Reset();
         else if (!strcmp(info->role, g_conf.trade_gw.c_str()))
             m_trade_gw.Reset();
+    } else {
+        rapidjson::Document::AllocatorType& alloc = m_doc.GetAllocator();
+        m_doc.AddMember("action", "logoutMsg", alloc);
+        m_doc.AddMember("uid", rapidjson::Value().SetString(info->name, strlen(info->name)), alloc);
+
+        m_doc.Accept(m_writer);
+        std::string json = m_buffer.GetString();
+        m_doc.RemoveAllMembers();
+        m_buffer.Clear();
+        m_writer.Reset(m_buffer);
+        post_phpserver(false, info, MSG_NOTIFY_USRLOGOUT, json.c_str(), json.size());
+        g_logger.print_ts("[OnClose] 通知php后台用户%s(%x:%x)下线 %s\n", info->name,
+                          info->id.h, info->id.l, json.c_str());
     }
     return 1000;		//自动重联
 }
 
 //此处必须解析客户端发送的json串，因为uid保存在串中，再根据uid来判断之前是否已经登陆过(交易实例将一直维持到OnFrontDisconnected)
 void data_trans::OnRequest(E15_ServerInfo * info,E15_ServerRoute * rt,E15_ServerCmd * cmd,E15_String *& data) {
+    g_logger.print_ts("[name=%s %x:%x] 收到请求 %d: %s\n", info->name,
+                      info->id.h, info->id.l, cmd->cmd, data->c_str());
+
     switch (cmd->cmd) {
         case MSG_LOGIN_FUTUREACC:
-        case MSG_COMMIT_ORDER: {		//将指定请求发送给域内部服务
+        case MSG_COMMIT_ORDER:
+        case MSG_ACTIVATE_LEADERORDER: {		//将指定请求发送给域内部服务
             m_gw->trade_relate(info, cmd, data);
             break;
         }
         default: {		//其他消息都转发给php服务
-            int conn = m_http_client->connect(g_conf.post_addr.c_str(), g_conf.post_port);
-            if (-1 == conn) {
-                g_logger.print_ts("[OnRequest] 连接php服务器失败\n");
-                return;
-            }
-
-            m_conn_session[conn].id = info->id;
-            m_conn_session[conn].msg = (JYMSG)cmd->cmd;
-
-            std::map<std::string, std::string> ext_headers;
-            ext_headers["Uid"] = info->name;
-            m_http_client->POST(conn, g_conf.post_page.c_str(), nullptr, data->c_str(), data->Length());
-            g_logger.print_ts("[name=%s %x:%x conn=%d] 收到请求 %d: %s\n", info->name, info->id.h, info->id.l,
-                              conn, cmd->cmd, data->c_str());
+            post_phpserver(true, info, cmd->cmd, data->c_str(), data->Length());
             break;
         }
     }
+}
+
+void data_trans::post_phpserver(bool response, E15_ServerInfo *info,
+                                int cmd, const char *data, int len) {
+    int conn = m_http_client->connect(g_conf.post_addr.c_str(), g_conf.post_port);
+    if (-1 == conn) {
+        g_logger.print_ts("[OnRequest] 连接php服务器失败\n");
+        return;
+    }
+
+    m_conn_session[conn].id = info->id;
+    m_conn_session[conn].msg = (JYMSG)cmd;
+    m_conn_session[conn].response = response;
+
+    m_ext_headers["Uid"] = info->name;
+    m_http_client->POST(conn, g_conf.post_page.c_str(), &m_ext_headers, data, len);
+}
+
+void data_trans::http_transmit(int conn, int status, std::map<std::string, std::string>& headers,
+                               std::string& body, void *args) {
+    data_trans *trans = static_cast<data_trans*>(args);
+    if (trans->m_conn_session.end() != trans->m_conn_session.find(conn)) {
+        auto& client_session = trans->m_conn_session[conn];
+        E15_ServerCmd cmd;
+        cmd.cmd = client_session.msg;
+        if (client_session.response)        //响应
+            trans->Response(&client_session.id, 0, &cmd, body.c_str(), body.size());
+        else
+            trans->Notify(&client_session.id, 0, &cmd, body.c_str(), body.size());
+        g_logger.print_ts("[%x:%x conn=%d status=%d] 转发http响应：%d\n", client_session.id.h, client_session.id.l,
+                          conn, status, body.size());
+        trans->m_conn_session.erase(conn);
+    }
+    trans->m_http_client->release(conn);
 }
 
 void data_trans::query_load(const char *uid) {
@@ -92,11 +145,11 @@ void data_trans::OnResponse(E15_ServerInfo * info,E15_ServerRoute * rt,E15_Serve
                 m_doc.RemoveAllMembers();
                 m_buffer.Clear();
                 m_writer.Reset(m_buffer);
-                m_gw->response_login_account(ri->err_id, ri->uid, info->id, result);
+                m_gw->response_login_account(ri->err_id, ri->uid, info->id, info->name, result);
                 break;
             }
             case MSG_COMMIT_ORDER: {		//转发报单结果
-                Response(&cmd->receiver, 0, cmd, data);
+                m_gw->trans_result(true, cmd, data);
                 break;
             }
         }
@@ -105,33 +158,8 @@ void data_trans::OnResponse(E15_ServerInfo * info,E15_ServerRoute * rt,E15_Serve
     }
 }
 
-void data_trans::http_transmit(int conn, int status, std::map<std::string, std::string>& headers,
-                               std::string& body, void *args) {
-    data_trans *trans = static_cast<data_trans*>(args);
-    if (trans->m_conn_session.end() != trans->m_conn_session.find(conn)) {
-        auto& client_session = trans->m_conn_session[conn];
-        E15_ServerCmd cmd;
-        cmd.cmd = client_session.msg;
-        trans->Response(&client_session.id, 0, &cmd, body.c_str(), body.size());
-        g_logger.print_ts("[%x:%x conn=%d status=%d] 转发http响应：%d\n", client_session.id.h, client_session.id.l,
-                          conn, status, body.size());
-        trans->m_conn_session.erase(conn);
-    }
-    trans->m_http_client->release(conn);
-}
-
 void data_trans::OnNotify(E15_ServerInfo * info,E15_ServerRoute * rt,E15_ServerCmd * cmd,E15_String *& data) {
-    if (!strcmp(info->role, g_conf.trade_server.c_str())) {		//交易服务推送的消息
-//		if (MSG_REPORT_TRADELOAD == cmd->cmd) {		//报告交易负载
-//			int *load = (int*)data->c_str();
-//			m_trade_servers[info->name].load = *load;
-//			g_logger.print_ts("[OnNotify] 交易服务 %s 报告当前的负载 %d\n", info->name, *load);
-//		} else {		//推送给客户端的消息
-//			Notify(&cmd->receiver, 0, cmd, data);
-//		}
-    } else {		//其他服务推送的消息
-        Notify(&cmd->receiver, 0, cmd, data);
-    }
+    m_gw->trans_result(false, cmd, data);     //转发其他服务推送的消息
 }
 
 bool app_gw::init(int argc, char *argv[]) {
@@ -175,6 +203,8 @@ void app_gw::cons_response_json(E15_ServerInfo *info, E15_ServerCmd *cmd,
     m_buffer.Clear();
     m_writer.Reset(m_buffer);
     m_trans->Response(&info->id, 0, cmd, json.c_str(), json.size());
+    g_logger.print_ts("[cons_response_json] name=%s,cmd=%d 返回响应 %s\n",
+                      info->name, cmd->cmd, json.c_str());
 }
 
 bool app_gw::parse_request(int cmd, const char *json, std::map<std::string, std::string>& kvs) {
@@ -203,6 +233,8 @@ void app_gw::trade_relate(E15_ServerInfo *info, E15_ServerCmd *cmd, E15_String *
                 if (m_uid_cache.end() != m_uid_cache.find(info->name)) {		//该账号的其他的设备发起登陆请求
                     auto& cache = m_uid_cache[info->name];
                     cache.client_ids.push_back(info->id);
+                    g_logger.print_ts("[trade_relate]未登陆时同时有多个账号发起登陆请求,记录当前连接"
+                                              "%s(%x:%x)\n", info->name, info->id.h, info->id.l);
                     return;
                 }
 
@@ -211,11 +243,14 @@ void app_gw::trade_relate(E15_ServerInfo *info, E15_ServerCmd *cmd, E15_String *
                 cache.data = data;
                 data = nullptr;
                 m_trans->query_load(info->name);
+                g_logger.print_ts("[trade_relate] 用户%s(%x:%x)未登陆,查询负载\n", info->name,
+                                  info->id.h, info->id.l);
             } else {		//通知已登陆完成消息
                 cons_response_json(info, cmd, 0, nullptr);
             }
             break;
         }
+
         case MSG_COMMIT_ORDER: {			//下单
             if (m_uid_session.end() == m_uid_session.find(info->name)) {		//还未登陆，报告异常消息
                 cons_response_json(info, cmd, 1, "用户还未登陆");
@@ -232,15 +267,33 @@ void app_gw::trade_relate(E15_ServerInfo *info, E15_ServerCmd *cmd, E15_String *
                 order.offset_flag = std::atoi(kvs["offset_flag"].c_str());
                 order.direction = std::atoi(kvs["direction"].c_str());
                 strcpy(order.vip_uid, kvs["vip_uid"].c_str());
-                cmd->sender = info->id;
                 m_trans->Request(&m_uid_session[info->name].trader_id, 0, cmd, (const char*)&order, sizeof(order));
+                g_logger.print_ts("[trade_relate] 用户%s(%x:%x)提交下单请求: ins_id=%s,volume=%d,"
+                                          "offset_flag=%d, direction=%d\n", info->name, info->id.h, info->id.l,
+                                  order.ins_id, order.volume, order.offset_flag, order.direction);
+            }
+            break;
+        }
+
+        case MSG_ACTIVATE_LEADERORDER: {        //激活领单
+            if (m_uid_session.end() == m_uid_session.find(info->name)) {        //还未登陆
+                cons_response_json(info, cmd, 1, "用户还未登陆");
+            } else {
+                E15_String str;
+                str.Memcpy(info->name, strlen(info->name));
+                str.Resize(16, 0);
+                str.Memcat(data->c_str(), data->Length());
+                m_trans->Request(&m_uid_session[info->name].trader_id, 0, cmd, str.c_str(), str.Length());
+                g_logger.print_ts("[trade_relate] 用户%s(%x:%x)发起激活领单: json=%s\n", info->name,
+                                  info->id.h, info->id.l, data->c_str());
             }
             break;
         }
     }
 }
 
-void app_gw::response_login_account(int err_id, const char *uid, E15_Id& id, const std::string& json) {
+void app_gw::response_login_account(int err_id, const char *uid, E15_Id& id,
+                                    const char *name, const std::string& json) {
     std::lock_guard<std::mutex> lck(m_trader_mtx);
     if (m_uid_cache.end() == m_uid_cache.find(uid))
         return;
@@ -248,6 +301,7 @@ void app_gw::response_login_account(int err_id, const char *uid, E15_Id& id, con
     if (!err_id) {
         m_uid_session[uid].trader_id = id;
         m_uid_session[uid].client_ids = std::move(m_uid_cache[uid].client_ids);
+        m_trader_uids[name].insert(uid);
     }
 
     E15_ServerCmd cmd;
@@ -255,6 +309,34 @@ void app_gw::response_login_account(int err_id, const char *uid, E15_Id& id, con
     for (auto& client_id : m_uid_session[uid].client_ids)
         m_trans->Response(&client_id, 0, &cmd, json.c_str(), json.size());
     m_uid_cache.erase(uid);
+    g_logger.print_ts("[response_login_account] 用户%s在交易服务%x:%x上的登陆请求反馈的结果: %s\n",
+                      uid, id.h, id.l, json.c_str());
+}
+
+void app_gw::trans_result(bool response, E15_ServerCmd *cmd, E15_String *data) {
+    const char *uid = data->c_str();
+    std::lock_guard<std::mutex> lck(m_trader_mtx);
+    if (m_uid_session.end() == m_uid_session.find(uid))
+        return;
+
+    auto& session = m_uid_session[uid];
+    for (auto& client_id : session.client_ids) {
+        if (response)
+            m_trans->Response(&client_id, 0, cmd, data->c_str()+16, data->Length()-16);
+        else
+            m_trans->Notify(&client_id, 0, cmd, data->c_str()+16, data->Length()-16);
+    }
+    g_logger.print_ts("[trans_result] 转发用户(%s)的响应或推送: %s\n", uid, data->c_str()+16);
+}
+
+void app_gw::notify_trader_offline(const char *name) {
+    std::lock_guard<std::mutex> lck(m_trader_mtx);
+    if (m_trader_uids.end() == m_trader_uids.find(name))
+        return;
+
+    for (auto& uid : m_trader_uids[name])
+        m_uid_session.erase(uid);
+    m_trader_uids.erase(name);
 }
 
 void app_gw::respone_query_load(E15_Id& id, const std::string& uid) {
@@ -262,6 +344,8 @@ void app_gw::respone_query_load(E15_Id& id, const std::string& uid) {
     if (m_uid_cache.end() == m_uid_cache.find(uid))
         return;
 
+    g_logger.print_ts("[respone_query_load] 得到查询负载的响应,用户(%s)将在交易服务%x:%x执行登陆操作\n",
+                      uid.c_str(), id.h, id.l);
     auto& cache = m_uid_cache[uid];
     cache.trader_id = id;
     m_load_event->send_signal(uid.c_str(), uid.size());
@@ -287,9 +371,28 @@ void app_gw::handle_select_trader(const std::string& signal, void *args) {
     E15_ServerCmd cmd;
     cmd.cmd = MSG_LOGIN_FUTUREACC;
     gw->m_trans->Request(&cache.trader_id, 0, &cmd, (const char*)&login, sizeof(login));
+    g_logger.print_ts("[handle_select_trader] 向交易服务%x:%x 发送用户登陆请求: uid=%s, broker_id=%s, "
+                              "account=%s, password=%s\n", cache.trader_id.h, cache.trader_id.l,
+                      login.uid, login.broker_id, login.account, login.passwd);
+}
+
+void app_gw::show_login_uid() {
+    int index = 1;
+    std::stringstream ss;
+    ss<<'\n'<<std::left<<std::setw(8)<<"seq"<<std::setw(16)<<"uid"<<"trade_server\n";
+    char buffer[32];
+    std::lock_guard<std::mutex> lck(m_trader_mtx);
+    for (auto& us : m_uid_session) {
+        sprintf(buffer, "%x:%x", us.second.trader_id.h, us.second.trader_id.l);
+        ss<<std::left<<std::setw(8)<<index++<<std::setw(16)<<us.first<<buffer<<'\n';
+    }
+    std::cout<<ss.rdbuf()<<std::endl;
 }
 
 int main(int argc, char *argv[]) {
     app_gw gw;
+    gw.add_cmd("su", [&](const std::vector<std::string>& args, crx::console *c){
+        gw.show_login_uid();
+    }, "显示当前处于交易状态的用户");
     return gw.run(argc, argv);
 }

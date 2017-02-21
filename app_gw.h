@@ -17,6 +17,7 @@ struct app_gw_conf {
 struct client_http_req {
     E15_Id id;
     JYMSG msg;
+    bool response;
 };
 
 class app_gw;
@@ -42,6 +43,9 @@ public:
 
     void query_load(const char *uid);
     static void http_transmit(int conn, int status, std::map<std::string, std::string>& headers, std::string& body, void *args);
+
+private:
+    void post_phpserver(bool response, E15_ServerInfo *info, int cmd, const char *data, int len);
 
 private:
     //servers
@@ -79,16 +83,22 @@ public:
     app_gw()
             :m_writer(m_buffer) {
         m_doc.SetObject();
-        m_cmd_keys[MSG_LOGIN_FUTUREACC]	= {"broker_id", "account", "passwd"};		//登陆
-        m_cmd_keys[MSG_COMMIT_ORDER]		= {"ins_id", "volume", "offset_flag", "direction", "vip_uid"};		//下单
+        m_cmd_keys[MSG_LOGIN_FUTUREACC] = {"broker_id", "account", "passwd"};		//登陆
+        m_cmd_keys[MSG_COMMIT_ORDER]    = {"ins_id", "md_date", "md_time", "price", "volume",
+                                           "offset_flag", "direction", "vip_uid"};	//下单
     }
     virtual ~app_gw() {}
 
     virtual bool init(int argc, char *argv[]);
     virtual void destroy();
 
+    void notify_trader_offline(const char *name);
+    void show_login_uid();
     void respone_query_load(E15_Id& id, const std::string& uid);
-    void response_login_account(int err_id, const char *uid, E15_Id& id, const std::string& json);
+    void response_login_account(int err_id, const char *uid, E15_Id& id,
+                                const char *name, const std::string& json);
+
+    void trans_result(bool response, E15_ServerCmd *cmd, E15_String *data);
     void trade_relate(E15_ServerInfo *info, E15_ServerCmd *cmd, E15_String *& data);
 
 private:
@@ -103,8 +113,9 @@ private:
 
     crx::event *m_load_event;
     std::mutex m_trader_mtx;
-    std::map<std::string, login_session> m_uid_session;		//登陆session，it->first: uid
-    std::map<std::string, login_cache> m_uid_cache;			//登陆缓存，需要首先查可用的trade_server, it->first: uid
+    std::map<std::string, std::set<std::string>> m_trader_uids;     //it->first: trader_name, it->second: uids
+    std::map<std::string, login_session> m_uid_session;		//登陆session,it->first: uid
+    std::map<std::string, login_cache> m_uid_cache;			//登陆缓存,需要首先查可用的trade_server, it->first: uid
 
     rapidjson::Document m_doc;			//构造响应的json串
     rapidjson::StringBuffer m_buffer;
